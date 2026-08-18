@@ -1,0 +1,113 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+
+trigger:
+  branches:
+    include:
+      - uat
+      - release/*
+      - feature/*
+
+pool:
+  name: 'NavsoftWebServer'
+
+variables:
+  - group: BCSecrets
+  - name: alProjectFolder
+    value: 'Src'
+  - name: outputFolder
+    value: 'artifacts'
+  - name: artifactName
+    value: 'BC App'
+
+steps:
+  - task: PowerShell@2
+    displayName: 'Auto-increment version in app.json'
+    inputs:
+      targetType: 'inline'
+      script: |
+        $appJsonPath = "$(Build.SourcesDirectory)/$(alProjectFolder)/app.json"
+
+        if (-Not (Test-Path $appJsonPath)) {
+          Write-Error "app.json not found at $appJsonPath"
+          exit 1
+        }
+
+        $appJson = Get-Content $appJsonPath -Raw | ConvertFrom-Json
+        $versionParts = $appJson.version -split '\.'
+
+        # Static major.minor.build version (adjust if needed)
+        $major = 26
+        $minor = 0
+        $build = 0
+        $revision = $(Build.BuildId)
+
+        $newVersion = "$major.$minor.$build.$revision"
+        Write-Host "📦 Setting version to $newVersion"
+
+        $appJson = Get-Content $appJsonPath -Raw | ConvertFrom-Json
+        $appJson.version = $newVersion
+        $appJson | ConvertTo-Json -Depth 10 | Set-Content $appJsonPath -Encoding UTF8
+
+  - task: PowerShell@2
+    displayName: 'Compile AL Project'
+    inputs:
+      targetType: 'inline'
+      script: |
+        $projectPath = "$(Build.SourcesDirectory)/$(alProjectFolder)"
+        $outputPath = "$(Build.ArtifactStagingDirectory)/$(outputFolder)"
+        New-Item -ItemType Directory -Force -Path $outputPath | Out-Null
+
+        $alcPath = "C:\Users\Administrator\.vscode\extensions\ms-dynamics-smb.al-17.0.2273547\bin\win32"
+        $alc = Get-ChildItem -Path $alcPath -Filter "alc.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+
+        if (-not $alc) {
+          throw "alc.exe not found. Please install AL Language extension or check the path."
+        }
+
+        & "$($alc.FullName)" /project:"$projectPath" /packagecachepath:"$projectPath\.alpackages" /out:"$outputPath\MyApp.app"
+
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish .app Artifact'
+    inputs:
+      PathtoPublish: '$(Build.ArtifactStagingDirectory)/$(outputFolder)'
+      ArtifactName: '$(artifactName)'
+      publishLocation: 'Container'
+
+  - task: PowerShell@2
+    displayName: 'Deploy to Business Central (UAT)'
+    inputs:
+      targetType: 'inline'
+      script: |
+        try {
+          if (-not (Get-Module -ListAvailable BcContainerHelper)) {
+            Install-Module BcContainerHelper -Force -Scope CurrentUser -AllowClobber
+          }
+          Import-Module BcContainerHelper -Force
+
+          $appFile = Get-ChildItem -Path "$(Build.ArtifactStagingDirectory)/$(outputFolder)" -Filter "*.app" | Select-Object -First 1
+
+          if (-not $appFile) {
+            throw "App file not found in output directory."
+          }
+
+          $authContext = New-BcAuthContext `
+            -clientID "$(bcClientId)" `
+            -clientSecret "$(bcClientSecret)" `
+            -tenantID "$(bcTenantId)" `
+            -environment "$(bcEnvironmentUAT)"
+
+          Write-Host "Publishing app to Business Central UAT..."
+          Publish-PerTenantExtensionApps `
+            -appFiles @($appFile.FullName) `
+            -bcAuthContext $authContext `
+            -environment "$(bcEnvironmentUAT)" 
+           Write-Host "✅ App published successfully!"  
+        }
+        catch {
+          Write-Error "Deployment failed: $_"
+          exit 1
+        }
